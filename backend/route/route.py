@@ -1,19 +1,57 @@
 from fastapi import APIRouter, HTTPException
 import asyncio
 import subprocess
-import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-from models.model import user_info
+import pandas as pd
+import re
+
+from models.model import user_info, chat_prompt
+
+from konlpy.tag import Okt
 
 router = APIRouter()
 
-async def fetch_ans_llama31(prompt_type: str):
+okt = Okt()
+
+# 형태소 분석 및 명사+형용사 추출
+def preprocess_and_tokenize(text: str) -> str:
+    # 소문자 변환 및 불필요한 공백 제거
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # 명사와 형용사 추출
+    tokens = okt.pos(text, stem=True)  # stem=True를 사용하면 동사 및 형용사의 기본형을 추출
+    words = [word for word, pos in tokens if pos in ['Noun', 'Adjective']]  # 명사(Noun)와 형용사(Adjective)만 추출
+    
+    return ' '.join(words)
+
+# 보고서 로드 및 전처리 + 토큰화
+def load_and_preprocess_report(file_path: str):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        report_text = file.read()
+    
+    # 보고서 문장 단위로 분리 및 전처리
+    report_lines = [preprocess_and_tokenize(line) for line in report_text.splitlines()]
+
+    # TF-IDF 벡터화 (n-gram 추가)
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=0.05)
+    report_vectors = vectorizer.fit_transform(report_lines)
+    
+    return report_lines, report_vectors, vectorizer
+
+report_path = "report.md"
+report_lines, report_vectors, vectorizer = load_and_preprocess_report(report_path)
+
+async def fetch_ans_llama31(prompt: str):
     loop = asyncio.get_event_loop()
 
     result = await loop.run_in_executor(
         None,
         lambda: subprocess.run(
-            ["ollama", "run", "llama3.1", prompt_type],
+            ["ollama", "run", "llama3.1", prompt],
             capture_output=True,
             text=True
         )
@@ -22,10 +60,50 @@ async def fetch_ans_llama31(prompt_type: str):
     output = result.stdout.strip()
     return output
 
+def search_report_for_answer(query: str, max_results: int = 3):
+    # 질문을 전처리 및 토큰화
+    query = preprocess_and_tokenize(query)
+    print("[Tokenized Query]:", query)
+
+    # 질문을 벡터화
+    query_vector = vectorizer.transform([query])
+    print("[Query Vector Shape]:", query_vector.shape)
+
+    # 보고서 벡터 정보 확인
+    print("[Report Vectors Shape]:", report_vectors.shape)
+
+    # 코사인 유사도 계산
+    cosine_similarities = cosine_similarity(query_vector, report_vectors).flatten()
+
+    # 유사도가 가장 높은 문장 3개 선택
+    related_indices = cosine_similarities.argsort()[-max_results:][::-1]
+    
+    # 유사도가 0인 경우 필터링
+    related_results = [report_lines[i] for i in related_indices if cosine_similarities[i] > 0]
+    print("[Search] Found related results : ", related_results)
+
+    return "\n".join(related_results) if related_results else "관련된 정보가 없습니다."
+
 @router.post("/chat")
-async def chat(prompt: str):
+async def chat(chat_prompt: chat_prompt):
+
+    prev_chat = chat_prompt.prev_chat
+    prompt = chat_prompt.prompt
+
     try:
-        response = await fetch_ans_llama31(prompt)
+
+        relevant_info = search_report_for_answer(prompt)
+
+        extended_prompt = f"""
+        문서에서 찾은 정보:\n{relevant_info}\n\n
+        질문: {prompt}\n\n
+        이전 대화: {prev_chat}\n\n
+
+        위 정보를 바탕으로 질문에 대한 답변을 두 문장 내로 작성해주세요.
+        """
+
+        response = await fetch_ans_llama31(extended_prompt)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -88,5 +166,12 @@ async def report(user_info: user_info):
     ## save as markdown file
     with open('report.md', 'w') as f:
         f.write(response)
+
+    return {"response": response}
+
+@router.get("/get_report")
+async def get_report():
+    with open('report.md', 'r') as f:
+        response = f.read()
 
     return {"response": response}
