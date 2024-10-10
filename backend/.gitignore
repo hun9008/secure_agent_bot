@@ -1,3 +1,4 @@
 sh_secure
 src
 __pycache__
+.env

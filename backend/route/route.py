@@ -7,14 +7,21 @@ import numpy as np
 
 import pandas as pd
 import re
+import os
 
 from models.model import user_info, chat_prompt
 
 from konlpy.tag import Okt
+import anthropic
+from dotenv import load_dotenv
 
 router = APIRouter()
 
 okt = Okt()
+
+load_dotenv()
+
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # 형태소 분석 및 명사+형용사 추출
 def preprocess_and_tokenize(text: str) -> str:
@@ -60,6 +67,25 @@ async def fetch_ans_llama31(prompt: str):
     output = result.stdout.strip()
     return output
 
+async def fetch_ans_claude(prompt: str):
+    print("[Claude Prompt]:", prompt)
+    try:
+        # 프롬프트 형식을 'Human'과 'Assistant' 구조로 맞춤
+        full_prompt = f"\n\nHuman: {prompt}\n\nAssistant:"  # Human 질문으로 시작하고 Assistant의 응답으로 이어지게끔 포맷
+
+        message = client.completions.create(
+            model="claude-2",
+            prompt=full_prompt,
+            max_tokens_to_sample=1024,
+            temperature=0.2
+        )
+
+        return message.completion.strip()
+
+    except Exception as e:
+        print(f"Claude API 호출 실패: {e}")
+        raise HTTPException(status_code=500, detail="Claude API 호출 실패")
+
 def search_report_for_answer(query: str, max_results: int = 3):
     # 질문을 전처리 및 토큰화
     query = preprocess_and_tokenize(query)
@@ -99,10 +125,10 @@ async def chat(chat_prompt: chat_prompt):
         질문: {prompt}\n\n
         이전 대화: {prev_chat}\n\n
 
-        위 정보를 바탕으로 질문에 대한 답변을 두 문장 내로 작성해주세요.
+        위 정보를 바탕으로 질문에 대한 답변을 3~5문장 이내로 작성해주세요.
         """
 
-        response = await fetch_ans_llama31(extended_prompt)
+        response = await fetch_ans_claude(extended_prompt)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
